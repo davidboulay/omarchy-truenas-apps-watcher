@@ -70,6 +70,27 @@ test("an explicit https:// web address is not downgraded", () => {
                      "https://nas.example.com/ui/apps/installed")
 })
 
+// A URL copied out of a browser's address bar keeps its trailing slash. It is
+// stripped when a request is built either way, but storing the canonical form
+// is what lets the settings form tell "saved" from "unsaved".
+test("a stored address drops trailing slashes and surrounding space", () => {
+  assert.strictEqual(Model.normalizeAddress("  https://portainer.example.com/  "),
+                     "https://portainer.example.com")
+  assert.strictEqual(Model.normalizeAddress("https://portainer.example.com//"),
+                     "https://portainer.example.com")
+  assert.strictEqual(Model.normalizeAddress("truenas.local"), "truenas.local")
+  assert.strictEqual(Model.normalizeAddress(""), "")
+  assert.strictEqual(Model.normalizeAddress(null), "")
+})
+
+test("a trailing slash never reaches the request either way", () => {
+  const withSlash = Model.candidateBases("https://portainer.example.com/")
+  const without = Model.candidateBases("https://portainer.example.com")
+  assert.deepStrictEqual(plain(withSlash), plain(without))
+  assert.strictEqual(withSlash[0] + "/api/endpoints",
+                     "https://portainer.example.com/api/endpoints")
+})
+
 // ---------------------------------------------------------------- curl auth
 
 test("the API key becomes one bearer header line", () => {

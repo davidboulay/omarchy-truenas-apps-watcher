@@ -32,6 +32,17 @@ function normalizeBase(address) {
   return candidates.length > 0 ? candidates[0] : ""
 }
 
+// An address as it should be *stored*: trimmed, and without the trailing slash
+// a browser's address bar hands you when you copy a URL out of it.
+// candidateBases() strips one anyway when it builds a request, so this changes
+// no traffic — it keeps the settings form honest instead. Saving
+// "https://host/" and "https://host" as the same string means the form can
+// tell "saved" from "unsaved" by comparing them, and the field shows back
+// exactly what was stored.
+function normalizeAddress(address) {
+  return String(address || "").replace(/^\s+|\s+$/g, "").replace(/\/+$/, "")
+}
+
 // Where to point a *browser*, which is a different question from where to
 // point curl. curl can be told to accept TrueNAS's self-signed certificate;
 // a browser cannot, and just throws a full-page warning at the user. So a

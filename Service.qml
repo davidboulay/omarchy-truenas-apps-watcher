@@ -146,10 +146,10 @@ Item {
   // ---------------------------------------------------------------- config
 
   function saveConfig(next) {
-    root.address = String(next.address || "").replace(/^\s+|\s+$/g, "")
+    root.address = Model.normalizeAddress(next.address)
     root.apiKey = String(next.apiKey || "").replace(/^\s+|\s+$/g, "")
     root.acceptInvalidCerts = next.acceptInvalidCerts !== false
-    root.portainerAddress = String(next.portainerAddress || "").replace(/^\s+|\s+$/g, "")
+    root.portainerAddress = Model.normalizeAddress(next.portainerAddress)
     root.portainerApiKey = String(next.portainerApiKey || "").replace(/^\s+|\s+$/g, "")
     writeConfig()
     // Start over against the new server: stale counts from the old one would
@@ -185,10 +185,12 @@ Item {
 
   function applyConfig(raw) {
     var parsed = Model.parseConfig(raw)
-    root.address = parsed.address
+    // Normalised on the way in as well as on the way out: a hand-edited
+    // config.json is just as likely to carry a pasted trailing slash.
+    root.address = Model.normalizeAddress(parsed.address)
     root.apiKey = parsed.apiKey
     root.acceptInvalidCerts = parsed.acceptInvalidCerts
-    root.portainerAddress = parsed.portainerAddress
+    root.portainerAddress = Model.normalizeAddress(parsed.portainerAddress)
     root.portainerApiKey = parsed.portainerApiKey
     root.configLoaded = true
     // Keys that were edited by hand need their curl configs regenerated.

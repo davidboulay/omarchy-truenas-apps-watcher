@@ -114,7 +114,12 @@ Panel {
   // have to walk the section columns to find it.
   property Item cursorTarget: null
 
-  function openSettings() {
+  // Whether the form has ever been filled from the saved connection. Until it
+  // has, the empty edit properties differ from the saved values and would read
+  // as an unsaved draft.
+  property bool draftSeeded: false
+
+  function seedDraft() {
     nasPanel.editAddress = nas.address
     nasPanel.editApiKey = nas.apiKey
     nasPanel.editInsecure = nas.acceptInvalidCerts
@@ -126,6 +131,16 @@ Panel {
     if (apiKeyField) apiKeyField.text = nas.apiKey
     if (portainerAddressField) portainerAddressField.text = nas.portainerAddress
     if (portainerKeyField) portainerKeyField.text = nas.portainerApiKey
+    nasPanel.draftSeeded = true
+  }
+
+  // Getting an API key means leaving the popup — and the popup closes when it
+  // loses focus. Re-reading the saved connection every time it reopens would
+  // throw away the address the user typed before going to fetch the key, so a
+  // form with unsaved edits in it is left exactly as it was found. Only a
+  // clean form is refreshed from what is actually saved.
+  function openSettings() {
+    if (!draftSeeded || !settingsDirty) seedDraft()
     nasPanel.showSettings = true
     Qt.callLater(function() { if (addressField) addressField.forceActiveFocus() })
   }
@@ -144,6 +159,10 @@ Panel {
       portainerAddress: nasPanel.editPortainerAddress,
       portainerApiKey: nasPanel.editPortainerApiKey
     })
+    // saveConfig() normalises what it stores, so read the draft back from it:
+    // the fields then show the address as saved, and the button settles on
+    // "Saved" instead of staying dirty over a stripped trailing slash.
+    seedDraft()
     closeSettings()
   }
 
@@ -151,12 +170,15 @@ Panel {
     return String(text || "").replace(/^\s+|\s+$/g, "")
   }
 
-  readonly property bool settingsDirty: trimmed(editAddress) !== nas.address
+  // Addresses are compared the way they are stored, so a pasted trailing slash
+  // is not mistaken for an edit.
+  readonly property bool settingsDirty: Model.normalizeAddress(editAddress) !== nas.address
     || trimmed(editApiKey) !== nas.apiKey
     || editInsecure !== nas.acceptInvalidCerts
-    || trimmed(editPortainerAddress) !== nas.portainerAddress
+    || Model.normalizeAddress(editPortainerAddress) !== nas.portainerAddress
     || trimmed(editPortainerApiKey) !== nas.portainerApiKey
-  readonly property bool settingsValid: trimmed(editAddress) !== "" && trimmed(editApiKey) !== ""
+  readonly property bool settingsValid: Model.normalizeAddress(editAddress) !== ""
+    && trimmed(editApiKey) !== ""
 
   // Nothing to watch and nothing to configure yet is still worth a bar slot —
   // that is where the settings live. Only "everything is current" can hide.
@@ -168,7 +190,10 @@ Panel {
     cursorActive = false
     cursorIndex = 0
     if (panelFlick) panelFlick.contentY = 0
-    nasPanel.showSettings = !nas.configured
+    // Reopening lands back on the form when there is an unsaved draft in it,
+    // so a half-finished setup is where the user left it rather than hidden
+    // behind the list.
+    nasPanel.showSettings = !nas.configured || (draftSeeded && settingsDirty)
     if (nasPanel.showSettings) openSettings()
     else if (nas.configured) nas.check(false)
     Qt.callLater(function() { if (!nasPanel.showSettings) keyCatcher.forceActiveFocus() })
