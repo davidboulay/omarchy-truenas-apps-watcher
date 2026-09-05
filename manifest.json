@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.davidboulay.truenas-apps-watcher",
+  "name": "TrueNAS Apps Watcher",
+  "version": "1.0.0",
+  "author": "David Boulay",
+  "license": "GPL-3.0-only",
+  "description": "Watches a TrueNAS SCALE server for pending app upgrades and newer container images — and, through Portainer, for updates to the containers TrueNAS doesn't manage — and applies them from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "TrueNAS Apps",
+    "description": "Pending TrueNAS app updates with versions, one-click apply with live job progress, and optional Portainer container watching.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalMin": 30,
+      "containerIntervalHours": 6,
+      "hideWhenUpToDate": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalMin",
+        "type": "integer",
+        "label": "Check interval (minutes)",
+        "min": 5,
+        "max": 720,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "How often to re-read TrueNAS's installed apps in the background."
+      },
+      {
+        "key": "containerIntervalHours",
+        "type": "integer",
+        "label": "Container check interval (hours)",
+        "min": 1,
+        "max": 168,
+        "step": 1,
+        "defaultValue": 6,
+        "description": "How often to ask the registries whether unmanaged containers have a newer image. One round trip per unique image, and a tag moves on the order of days, so keep this well above the app interval."
+      },
+      {
+        "key": "hideWhenUpToDate",
+        "type": "boolean",
+        "label": "Hide the widget when everything is up to date",
+        "defaultValue": false,
+        "description": "Keeps the bar clear until something actually needs updating."
+      }
+    ]
+  }
+}

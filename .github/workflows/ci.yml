@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Model.js is plain ES5 for QML's JS engine, so node runs it as-is.
+      - name: Unit tests
+        run: node test/model-test.js
+
+      # Mirrors the checks `omarchy plugin validate` makes, which cannot run
+      # here: no Omarchy on the runner.
+      - name: Manifest contract
+        run: node test/manifest-test.js
+
+      # qs.Commons / qs.Ui live in the Omarchy shell, which is not on the
+      # runner, so qmllint here would be mostly unresolved-import noise — and
+      # its category flags differ between Qt versions. qmlformat parses the
+      # file and nothing else, which is exactly the gate worth having, and it
+      # behaves the same on every Qt 6.
+      - name: QML parses
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qt6-declarative-dev-tools
+          FORMAT=$(command -v qmlformat6 || command -v qmlformat \
+                   || echo /usr/lib/qt6/bin/qmlformat)
+          "$FORMAT" -n Panel.qml > /dev/null
+          "$FORMAT" -n Service.qml > /dev/null
+
+      # Model.js has to stay parseable by QML's JS engine, which has no module
+      # system: no import/export, no optional chaining in the old engine.
+      - name: Model.js stays QML-safe
+        run: |
+          ! grep -nE '^\s*(import|export)\s' Model.js
