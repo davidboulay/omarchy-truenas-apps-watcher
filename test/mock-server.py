@@ -239,7 +239,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.stream_pull()
             m = re.match(r"^/api/docker/(\d+)/containers/([^/]+)/recreate$", path)
             if m:
-                self.read_body()
+                body = self.read_body()
+                # Which path the client took: a streamed pull first (False), or
+                # letting the recreate pull for it (True, the fallback).
+                print("recreate PullImage=%r" % body.get("PullImage"), flush=True)
                 time.sleep(1.0)
                 return self.send_json({"Id": m.group(2), "State": {"Running": True}})
         return self.send_json({"message": "not found"}, 404)

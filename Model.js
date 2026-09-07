@@ -126,14 +126,64 @@ function serializeConfig(config) {
 
 // ------------------------------------------------------------------ replies
 
-// `curl -sS -w "\n%{http_code}"` writes the body, then a newline, then the
-// status. Split from the right so a body that ends in a newline survives.
+// How many bytes of body each endpoint may deliver. The shell process is
+// long-lived and these replies are read into memory, so a compromised or
+// simply broken endpoint must not be able to grow it without bound — a
+// duration limit does not help, since thirty seconds of a fast stream is
+// hundreds of megabytes. Every limit is generous for the reply it covers and
+// still small enough to be harmless: the apps list is the biggest legitimate
+// one, at a few hundred kilobytes for a full NAS.
+var RESPONSE_LIMITS = {
+  small: 64 * 1024,           // job records, job ids, catalog sync: a few bytes
+  apps: 4 * 1024 * 1024,      // every installed app plus its catalog metadata
+  endpoints: 2 * 1024 * 1024, // Portainer's environment list
+  containers: 4 * 1024 * 1024,// one Docker environment's containers
+  imageInspect: 4 * 1024 * 1024,
+  registryHeaders: 256 * 1024,// a manifest HEAD: headers only, no body
+  registryToken: 64 * 1024,
+  recreate: 256 * 1024,
+  pullStream: 8 * 1024 * 1024 // per-layer progress events for a large image
+}
+
+// The trailer written by `-w "\n%{http_code} %{exitcode}"`.
+//
+// curl emits the write-out even when the transfer fails, which is what lets
+// its exit code travel *inside* the stream. That matters because curl no
+// longer runs as the process: it runs as the left half of a pipeline whose
+// ceiling is `head`, so the process exit status belongs to `head`, not to
+// curl. The message is deliberately not carried here — `%{errormsg}` can
+// contain anything, including a newline, and a trailer that cannot be found
+// is worse than a mapped exit code.
+function parseTrailer(line) {
+  var m = /^(\d{3}) (\d{1,3})$/.exec(String(line || "").replace(/^\s+|\s+$/g, ""))
+  if (!m) return null
+  return { code: parseInt(m[1], 10), exitCode: parseInt(m[2], 10) }
+}
+
+// Split the trailer off the end of a reply. Split from the right so a body
+// that ends in a newline survives. `hasTrailer` false means curl never got to
+// write it — the stream was cut off, or the pipeline never ran.
 function splitResponse(stdout) {
   var text = String(stdout === undefined || stdout === null ? "" : stdout)
   var cut = text.lastIndexOf("\n")
-  if (cut === -1) return { code: parseInt(text, 10) || 0, body: "" }
-  var code = parseInt(text.substring(cut + 1), 10)
-  return { code: isFinite(code) ? code : 0, body: text.substring(0, cut) }
+  var trailer = parseTrailer(cut === -1 ? text : text.substring(cut + 1))
+  if (!trailer) {
+    return { code: 0, exitCode: -1, body: text, hasTrailer: false }
+  }
+  return {
+    code: trailer.code,
+    exitCode: trailer.exitCode,
+    body: cut === -1 ? "" : text.substring(0, cut),
+    hasTrailer: true
+  }
+}
+
+// "4 MB" / "64 kB", for a message a user can act on.
+function describeBytes(bytes) {
+  var n = Number(bytes)
+  if (!isFinite(n) || n <= 0) return "the size limit"
+  if (n >= 1024 * 1024) return Math.round(n / (1024 * 1024)) + " MB"
+  return Math.round(n / 1024) + " kB"
 }
 
 // Turn one finished curl into either { ok: true, data } or a classified
@@ -141,16 +191,48 @@ function splitResponse(stdout) {
 // home network, or the NAS rebooting mid-upgrade — which callers retry quietly
 // instead of reporting. `server` names whichever of the two servers was asked,
 // so the message says which one is not answering.
-function interpretResponse(path, exitCode, stdout, stderr, server) {
+//
+// `processExit` is the *pipeline's* status, used only when there is no trailer
+// to read curl's own from. `limit` is the byte ceiling that applied, so an
+// oversized reply can say so instead of looking like a network fault.
+function interpretResponse(path, processExit, stdout, limit, server) {
   var who = String(server || "TrueNAS")
-  if (exitCode !== 0) {
+  var response = splitResponse(stdout)
+
+  // No trailer: curl never finished writing. Either the ceiling cut the
+  // stream off, or the pipeline itself never ran.
+  if (!response.hasTrailer) {
+    if (limit && String(stdout || "").length >= limit) {
+      return {
+        ok: false,
+        unreachable: false,
+        error: path + ": reply exceeded " + describeBytes(limit) + " and was cut off"
+      }
+    }
     return {
       ok: false,
       unreachable: true,
-      error: "Could not reach " + who + " (" + curlErrorText(exitCode, stderr) + ")"
+      error: "Could not reach " + who + " (" + curlErrorText(processExit, "") + ")"
     }
   }
-  var response = splitResponse(stdout)
+
+  if (response.exitCode !== 0) {
+    // An oversized reply is a fault at the far end, not a network blip, so it
+    // is reported rather than retried quietly forever.
+    if (response.exitCode === 63) {
+      return {
+        ok: false,
+        unreachable: false,
+        error: path + ": reply exceeded " + describeBytes(limit) + " and was refused"
+      }
+    }
+    return {
+      ok: false,
+      unreachable: true,
+      error: "Could not reach " + who + " (" + curlErrorText(response.exitCode, "") + ")"
+    }
+  }
+
   if (response.code === 401 || response.code === 403) {
     return { ok: false, unreachable: false, error: authErrorText(who) }
   }
@@ -203,10 +285,12 @@ function curlErrorText(exitCode, stderr) {
   var known = {
     6: "host not found",
     7: "connection refused",
+    23: "reply too large to read",
     28: "timed out",
     35: "TLS handshake failed",
     51: "certificate not trusted",
-    60: "certificate not trusted"
+    60: "certificate not trusted",
+    63: "reply too large"
   }
   if (known[exitCode]) return known[exitCode]
   var detail = String(stderr || "").replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "")
@@ -491,9 +575,9 @@ function tokenFrom(data) {
   return ""
 }
 
-// `curl -sSI -w "\n%{http_code}"` prints one header block per response (there
-// can be several when a registry redirects) and then the final status. Read
-// the last block: that is the response the status belongs to.
+// `curl -sSI` prints one header block per response (there can be several when
+// a registry redirects) and then the trailer. Read the last block: that is the
+// response the status belongs to.
 function parseHeadResponse(stdout) {
   var split = splitResponse(stdout)
   var blocks = String(split.body).replace(/\r/g, "").split(/\n\s*\n/)
@@ -510,15 +594,31 @@ function parseHeadResponse(stdout) {
     if (name === "" || name.indexOf(" ") !== -1) continue
     headers[name] = lines[j].substring(colon + 1).replace(/^\s+|\s+$/g, "")
   }
-  return { code: split.code, headers: headers }
+  return {
+    code: split.code,
+    exitCode: split.exitCode,
+    hasTrailer: split.hasTrailer,
+    headers: headers
+  }
 }
 
-// What a registry's answer to a manifest HEAD means.
-function interpretDigestResponse(exitCode, stdout, stderr) {
-  if (exitCode !== 0) {
-    return { state: "error", digest: "", challenge: "", error: "registry: " + curlErrorText(exitCode, stderr) }
-  }
+// What a registry's answer to a manifest HEAD means. A registry is the least
+// trusted of the three endpoints — it is whatever host a container image
+// happens to name — so the same byte ceiling applies to its headers.
+function interpretDigestResponse(processExit, stdout, limit) {
   var head = parseHeadResponse(stdout)
+  if (!head.hasTrailer) {
+    if (limit && String(stdout || "").length >= limit) {
+      return { state: "error", digest: "", challenge: "",
+               error: "registry: headers exceeded " + describeBytes(limit) }
+    }
+    return { state: "error", digest: "", challenge: "",
+             error: "registry: " + curlErrorText(processExit, "") }
+  }
+  if (head.exitCode !== 0) {
+    return { state: "error", digest: "", challenge: "",
+             error: "registry: " + curlErrorText(head.exitCode, "") }
+  }
   if (head.code === 401) {
     return { state: "auth", digest: "", challenge: head.headers["www-authenticate"] || "", error: "" }
   }

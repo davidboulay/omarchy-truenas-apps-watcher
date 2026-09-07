@@ -19,6 +19,9 @@ function plain(value) {
   return JSON.parse(JSON.stringify(value))
 }
 
+const LIMIT = Model.RESPONSE_LIMITS.apps
+const HLIMIT = Model.RESPONSE_LIMITS.registryHeaders
+
 let failures = 0
 function test(name, fn) {
   try {
@@ -137,21 +140,35 @@ test("config survives a round trip, including a deliberate false", () => {
 
 // ------------------------------------------------------------------ replies
 
-test("body and status code are split from the right", () => {
-  const r = Model.splitResponse("{\"a\":1}\n\n200")
+test("body and trailer are split from the right", () => {
+  const r = Model.splitResponse("{\"a\":1}\n\n200 0")
   assert.strictEqual(r.code, 200)
+  assert.strictEqual(r.exitCode, 0)
+  assert.strictEqual(r.hasTrailer, true)
   assert.strictEqual(r.body, "{\"a\":1}\n")
 })
 
+// curl's exit code rides in the trailer because the process is a pipeline now
+// and its status belongs to `head`, not to curl.
+test("a missing trailer is not mistaken for a status", () => {
+  const r = Model.splitResponse("{\"a\":1}")
+  assert.strictEqual(r.hasTrailer, false)
+  assert.strictEqual(r.code, 0)
+  assert.strictEqual(Model.parseTrailer("200 0").exitCode, 0)
+  assert.strictEqual(Model.parseTrailer("000 28").code, 0)
+  assert.strictEqual(Model.parseTrailer("200"), null)
+  assert.strictEqual(Model.parseTrailer("not a trailer"), null)
+})
+
 test("a good reply is parsed, an empty body is null", () => {
-  assert.deepStrictEqual(plain(Model.interpretResponse("/app", 0, "[1,2]\n200", "").data), [1, 2])
-  assert.strictEqual(Model.interpretResponse("/app", 0, "\n200", "").data, null)
+  assert.deepStrictEqual(plain(Model.interpretResponse("/app", 0, "[1,2]\n200 0", LIMIT).data), [1, 2])
+  assert.strictEqual(Model.interpretResponse("/app", 0, "\n200 0", LIMIT).data, null)
 })
 
 test("401 names the API key, and Portainer names its token", () => {
-  assert.strictEqual(Model.interpretResponse("/app", 0, "\n401", "").error,
+  assert.strictEqual(Model.interpretResponse("/app", 0, "\n401 0", LIMIT).error,
                      "Authentication failed — check the API key")
-  assert.strictEqual(Model.interpretResponse("/e", 0, "\n403", "", "Portainer").error,
+  assert.strictEqual(Model.interpretResponse("/e", 0, "\n403 0", LIMIT, "Portainer").error,
                      "Portainer authentication failed — check the access token")
 })
 
@@ -160,23 +177,59 @@ test("401 names the API key, and Portainer names its token", () => {
 test("gateway statuses are unreachable, not a refusal", () => {
   const statuses = [408, 502, 503, 504, 522, 524]
   for (const code of statuses) {
-    const r = Model.interpretResponse("/app", 0, "<html>Gateway Timeout</html>\n" + code, "")
+    const r = Model.interpretResponse("/app", 0, "<html>Gateway Timeout</html>\n" + code + " 0", LIMIT)
     assert.strictEqual(r.ok, false, String(code))
     assert.strictEqual(r.unreachable, true, String(code))
   }
 })
 
 test("a real HTTP error keeps its words but drops its markup", () => {
-  const r = Model.interpretResponse("/app", 0, "<h1>Bad  Request</h1>\n400", "")
+  const r = Model.interpretResponse("/app", 0, "<h1>Bad  Request</h1>\n400 0", LIMIT)
   assert.strictEqual(r.unreachable, false)
   assert.strictEqual(r.error, "/app: HTTP 400: Bad Request")
 })
 
 test("a dead connection names the server that did not answer", () => {
-  assert.strictEqual(Model.interpretResponse("/app", 7, "", "").error,
+  // curl reached the far end well enough to write a trailer: 000 plus its code.
+  assert.strictEqual(Model.interpretResponse("/app", 0, "\n000 7", LIMIT).error,
                      "Could not reach TrueNAS (connection refused)")
-  assert.strictEqual(Model.interpretResponse("/e", 60, "", "", "Portainer").error,
+  assert.strictEqual(Model.interpretResponse("/e", 0, "\n000 60", LIMIT, "Portainer").error,
                      "Could not reach Portainer (certificate not trusted)")
+  // No trailer at all and nothing near the ceiling: the pipeline itself failed.
+  assert.strictEqual(Model.interpretResponse("/app", 7, "", LIMIT).error,
+                     "Could not reach TrueNAS (connection refused)")
+})
+
+// The blocker the marketplace review found: a duration limit does not bound
+// memory. Both ceilings have to end up as a reported fault, and neither may
+// look like a network blip that gets retried quietly forever.
+test("an oversized reply is refused, and says so", () => {
+  // curl's own ceiling: exit 63, trailer intact.
+  const refused = Model.interpretResponse("/app", 0, "\n000 63", 4 * 1024 * 1024)
+  assert.strictEqual(refused.ok, false)
+  assert.strictEqual(refused.unreachable, false)
+  assert.strictEqual(refused.error, "/app: reply exceeded 4 MB and was refused")
+})
+
+test("a stream cut off by the byte ceiling is reported, not retried", () => {
+  // head closed the pipe, so there is no trailer and the body is at the cap.
+  const cut = Model.interpretResponse("/app", 0, "x".repeat(65536), 65536)
+  assert.strictEqual(cut.ok, false)
+  assert.strictEqual(cut.unreachable, false)
+  assert.strictEqual(cut.error, "/app: reply exceeded 64 kB and was cut off")
+})
+
+test("every endpoint declares a byte ceiling", () => {
+  const limits = Model.RESPONSE_LIMITS
+  for (const key of ["small", "apps", "endpoints", "containers", "imageInspect",
+                     "registryHeaders", "registryToken", "recreate", "pullStream"]) {
+    assert.ok(limits[key] > 0, "missing limit: " + key)
+    assert.ok(limits[key] <= 8 * 1024 * 1024, "limit too generous: " + key)
+  }
+  // The reply that is a stream by design still has to be bounded.
+  assert.ok(limits.pullStream > limits.apps)
+  assert.strictEqual(Model.describeBytes(64 * 1024), "64 kB")
+  assert.strictEqual(Model.describeBytes(4 * 1024 * 1024), "4 MB")
 })
 
 // --------------------------------------------------------------------- jobs
@@ -360,29 +413,29 @@ test("both spellings of a token response are accepted", () => {
 })
 
 const HEAD_OK = "HTTP/2 200\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n" +
-  "docker-content-digest: sha256:cafe\r\n\r\n\n200"
+  "docker-content-digest: sha256:cafe\r\n\r\n\n200 0"
 
 test("a manifest HEAD yields the digest", () => {
-  const r = Model.interpretDigestResponse(0, HEAD_OK, "")
+  const r = Model.interpretDigestResponse(0, HEAD_OK, HLIMIT)
   assert.strictEqual(r.state, "ok")
   assert.strictEqual(r.digest, "sha256:cafe")
 })
 
 test("only the last header block counts when the registry redirects", () => {
   const redirected = "HTTP/2 307\r\nlocation: https://elsewhere\r\n\r\n" +
-    "HTTP/2 200\r\ndocker-content-digest: sha256:beef\r\n\r\n\n200"
-  assert.strictEqual(Model.interpretDigestResponse(0, redirected, "").digest, "sha256:beef")
+    "HTTP/2 200\r\ndocker-content-digest: sha256:beef\r\n\r\n\n200 0"
+  assert.strictEqual(Model.interpretDigestResponse(0, redirected, HLIMIT).digest, "sha256:beef")
 })
 
 test("a 401 hands back its challenge instead of failing", () => {
-  const unauth = "HTTP/2 401\r\nwww-authenticate: Bearer realm=\"https://auth.docker.io/token\"\r\n\r\n\n401"
-  const r = Model.interpretDigestResponse(0, unauth, "")
+  const unauth = "HTTP/2 401\r\nwww-authenticate: Bearer realm=\"https://auth.docker.io/token\"\r\n\r\n\n401 0"
+  const r = Model.interpretDigestResponse(0, unauth, HLIMIT)
   assert.strictEqual(r.state, "auth")
   assert.strictEqual(Model.parseChallenge(r.challenge).realm, "https://auth.docker.io/token")
 })
 
 test("a 200 with no digest header is an error, not a silent pass", () => {
-  const r = Model.interpretDigestResponse(0, "HTTP/2 200\r\n\r\n\n200", "")
+  const r = Model.interpretDigestResponse(0, "HTTP/2 200\r\n\r\n\n200 0", HLIMIT)
   assert.strictEqual(r.state, "error")
   assert.strictEqual(r.digest, "")
 })

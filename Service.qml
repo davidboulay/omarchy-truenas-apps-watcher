@@ -163,6 +163,7 @@ Item {
     root.lastError = ""
     root.actionError = ""
     root.containerError = ""
+    root.containerRetries = 0
     root.configSaved()
     check(false)
     checkContainers()
@@ -202,45 +203,77 @@ Item {
 
   // ------------------------------------------------------------------ curl
 
-  // maxTime is in seconds. GET bodies are never used; `body` is a JSON string.
-  function curlCommand(method, path, body, maxTime) {
-    return buildCurl(root.baseUrl, root.authPath, method, path, body, maxTime)
+  // Two ceilings on every reply, because one is not enough.
+  //
+  // `--max-filesize` is curl's own: it ends the transfer cleanly with exit 63
+  // and still writes the trailer, so the failure explains itself. But it is
+  // documented to do nothing when the length is not known in advance, which
+  // is exactly the shape a hostile endpoint would choose, and how much it
+  // catches varies by curl version.
+  //
+  // So `head -c` is the backstop. It closes the pipe, curl dies on its next
+  // write, and the bytes that reach QML are bounded whatever the transfer or
+  // content encoding — chunked, gzipped, or an endless stream. Measured: it
+  // stops a chunked flood in about four milliseconds.
+  //
+  // The cost is that the process is now a pipeline, so its exit status belongs
+  // to `head`. curl's own code travels in the `-w` trailer instead, which also
+  // makes stderr redundant — it is discarded rather than collected, so there
+  // is no second unbounded buffer.
+  function capped(args, limit) {
+    return ["bash", "-c", 'cap="$1"; shift; "$@" 2>/dev/null | head -c "$cap"',
+            "--", String(limit + 4096)].concat(args)
   }
 
-  function portainerCommand(method, path, body, maxTime) {
-    return buildCurl(root.portainerBase, root.portainerAuthPath, method, path, body, maxTime)
+  // maxTime is in seconds, limit in bytes. GET bodies are never used; `body`
+  // is a JSON string.
+  function curlCommand(method, path, body, maxTime, limit) {
+    return buildCurl(root.baseUrl, root.authPath, method, path, body, maxTime, limit)
   }
 
-  function buildCurl(base, authFilePath, method, path, body, maxTime) {
+  function portainerCommand(method, path, body, maxTime, limit) {
+    return buildCurl(root.portainerBase, root.portainerAuthPath, method, path, body, maxTime, limit)
+  }
+
+  function buildCurl(base, authFilePath, method, path, body, maxTime, limit) {
     var args = ["curl", "-sS", "--connect-timeout", "10", "--max-time", String(maxTime),
-                "-w", "\n%{http_code}", "-K", authFilePath]
+                "--max-filesize", String(limit),
+                "-w", "\n%{http_code} %{exitcode}", "-K", authFilePath]
     if (root.acceptInvalidCerts) args.push("--insecure")
     if (method !== "GET") args.push("-X", method)
     if (body !== null && body !== undefined) {
       args.push("-H", "Content-Type: application/json", "--data-binary", body)
     }
     args.push(base + path)
-    return args
+    return capped(args, limit)
   }
 
   // Registry lookups go straight to Docker Hub / ghcr / lscr, not through
   // either server, so they carry neither `-K` file — sending the NAS's API key
   // to a public registry would be a real leak. The (short-lived, anonymous)
   // pull token still goes over stdin rather than argv, same rule as the rest.
+  //
+  // A registry is also the least trusted endpoint here: it is whichever host a
+  // container image happens to name. Its headers get the same ceiling.
   function registryHeadCommand(url) {
+    var limit = Model.RESPONSE_LIMITS.registryHeaders
     var args = ["curl", "-sSI", "-L", "--connect-timeout", "10", "--max-time", "30",
-                "-w", "\n%{http_code}", "-K", "-", "-H", "Accept: " + Model.MANIFEST_ACCEPT]
+                "--max-filesize", String(limit),
+                "-w", "\n%{http_code} %{exitcode}", "-K", "-",
+                "-H", "Accept: " + Model.MANIFEST_ACCEPT]
     if (root.acceptInvalidCerts) args.push("--insecure")
     args.push(url)
-    return args
+    return capped(args, limit)
   }
 
   function registryGetCommand(url) {
+    var limit = Model.RESPONSE_LIMITS.registryToken
     var args = ["curl", "-sS", "-L", "--connect-timeout", "10", "--max-time", "30",
-                "-w", "\n%{http_code}"]
+                "--max-filesize", String(limit),
+                "-w", "\n%{http_code} %{exitcode}"]
     if (root.acceptInvalidCerts) args.push("--insecure")
     args.push(url)
-    return args
+    return capped(args, limit)
   }
 
   // ------------------------------------------------------------ apps check
@@ -265,12 +298,12 @@ Item {
   function startCatalogSync() {
     // `catalog.sync` takes no arguments, which the REST layer maps to GET
     // (POST answers 405).
-    syncProc.command = curlCommand("GET", "/api/v2.0/catalog/sync", null, 60)
+    syncProc.command = curlCommand("GET", "/api/v2.0/catalog/sync", null, 60, Model.RESPONSE_LIMITS.small)
     syncProc.running = true
   }
 
   function runAppsQuery() {
-    appsProc.command = curlCommand("GET", "/api/v2.0/app", null, 30)
+    appsProc.command = curlCommand("GET", "/api/v2.0/app", null, 30, Model.RESPONSE_LIMITS.apps)
     appsProc.running = true
   }
 
@@ -355,11 +388,19 @@ Item {
     root._foundContainers = []
     root._containerErrors = []
     root._portainerTries = 0
-    endpointsProc.command = portainerCommand("GET", "/api/endpoints?limit=100", null, 30)
+    endpointsProc.command = portainerCommand("GET", "/api/endpoints?limit=100", null, 30, Model.RESPONSE_LIMITS.endpoints)
     endpointsProc.running = true
   }
 
   property int _portainerTries: 0
+
+  // A Portainer that is briefly unhappy — a proxy hiccup, a restart, a token
+  // check that raced a cold start — used to leave a red line in the popup
+  // until the six-hourly timer came round again. The apps side has always had
+  // its own quiet retries; this gives the container side the same courtesy,
+  // bounded so a genuinely rejected token settles down instead of hammering.
+  readonly property int maxContainerRetries: 5
+  property int containerRetries: 0
 
   function handleEndpoints(result) {
     if (!result.ok) {
@@ -367,7 +408,7 @@ Item {
         root._portainerTries++
         root.portainerIndex = (root.portainerIndex + 1) % root.portainerCandidates.length
         Qt.callLater(function() {
-          endpointsProc.command = root.portainerCommand("GET", "/api/endpoints?limit=100", null, 30)
+          endpointsProc.command = root.portainerCommand("GET", "/api/endpoints?limit=100", null, 30, Model.RESPONSE_LIMITS.endpoints)
           endpointsProc.running = true
         })
         return
@@ -375,9 +416,14 @@ Item {
       root.checkingContainers = false
       root.containersOffline = result.unreachable === true
       root.containerError = result.unreachable ? "" : result.error
+      if (root.containerRetries < root.maxContainerRetries) {
+        root.containerRetries++
+        containerRetryTimer.restart()
+      }
       return
     }
     root.containersOffline = false
+    root.containerRetries = 0
     root._endpointIds = Model.dockerEndpointIds(result.data)
     root._endpointIndex = 0
     nextEndpoint()
@@ -392,7 +438,7 @@ Item {
     var id = root._endpointIds[root._endpointIndex]
     containersProc.endpointId = id
     containersProc.command = portainerCommand(
-      "GET", "/api/endpoints/" + id + "/docker/containers/json", null, 30)
+      "GET", "/api/endpoints/" + id + "/docker/containers/json", null, 30, Model.RESPONSE_LIMITS.containers)
     containersProc.running = true
   }
 
@@ -418,7 +464,8 @@ Item {
     if (root._localDigests[localKey] === undefined) {
       inspectProc.localKey = localKey
       inspectProc.command = portainerCommand(
-        "GET", "/api/endpoints/" + c.endpointId + "/docker/images/" + c.imageId + "/json", null, 30)
+        "GET", "/api/endpoints/" + c.endpointId + "/docker/images/" + c.imageId + "/json", null, 30,
+        Model.RESPONSE_LIMITS.imageInspect)
       inspectProc.running = true
       return
     }
@@ -597,7 +644,7 @@ Item {
     var body = item.kind === "app"
       ? JSON.stringify({ app_name: item.name, options: { app_version: "latest" } })
       : JSON.stringify({ app_name: item.name })
-    startJobProc.command = curlCommand("POST", path, body, 60)
+    startJobProc.command = curlCommand("POST", path, body, 60, Model.RESPONSE_LIMITS.small)
     startJobProc.running = true
   }
 
@@ -638,7 +685,7 @@ Item {
       else failCurrentItem("timed out waiting for the job to finish")
       return
     }
-    jobProc.command = curlCommand("GET", "/api/v2.0/core/get_jobs?id=" + root._jobId, null, 30)
+    jobProc.command = curlCommand("GET", "/api/v2.0/core/get_jobs?id=" + root._jobId, null, 30, Model.RESPONSE_LIMITS.small)
     jobProc.running = true
   }
 
@@ -697,14 +744,18 @@ Item {
   // so the line splitter emits that last line too.
   function pullCommand(item) {
     var split = Model.splitNameTag(item.image)
+    var limit = Model.RESPONSE_LIMITS.pullStream
     var args = ["curl", "-sS", "-N", "--connect-timeout", "10", "--max-time", String(30 * 60),
-                "-w", "\n%{http_code}\n", "-K", root.portainerAuthPath]
+                "--max-filesize", String(limit),
+                "-w", "\n%{http_code} %{exitcode}\n", "-K", root.portainerAuthPath]
     if (root.acceptInvalidCerts) args.push("--insecure")
     args.push("-X", "POST")
     args.push(root.portainerBase + "/api/endpoints/" + item.endpointId + "/docker/images/create"
               + "?fromImage=" + encodeURIComponent(split.name)
               + "&tag=" + encodeURIComponent(split.tag))
-    return args
+    // This is the one reply that is a stream by design, and the longest-lived:
+    // an endless one would otherwise be read a line at a time, forever.
+    return capped(args, limit)
   }
 
   function startContainerPull(item) {
@@ -716,7 +767,9 @@ Item {
 
   function handlePullLine(line) {
     if (!root.installing) return
-    root._pullLastLine = String(line)
+    // The trailer is newline-terminated so the splitter emits it, which can
+    // leave an empty segment after it; keep the last line that had content.
+    if (String(line).replace(/^\s+|\s+$/g, "") !== "") root._pullLastLine = String(line)
     var result = Model.applyPullLine(root._pullLayers, line)
     if (!result.changed) return
     // The pull is nearly all the wall time; leave the last tenth for the
@@ -725,12 +778,16 @@ Item {
     publishProgress()
   }
 
-  function handlePullExit(exitCode) {
+  function handlePullExit() {
     if (!root.installing) return
     var item = currentItem()
     if (!item) return
-    var status = parseInt(root._pullLastLine, 10)
-    var pulled = exitCode === 0 && isFinite(status) && status >= 200 && status < 300
+    // The stream's own last line is the trailer, so the verdict comes from
+    // there rather than from the pipeline's exit status. No trailer means the
+    // ceiling cut it off — treat that as a pull that did not happen.
+    var trailer = Model.parseTrailer(root._pullLastLine)
+    var pulled = !!trailer && trailer.exitCode === 0
+      && trailer.code >= 200 && trailer.code < 300
     root._itemProgress = 0.9
     publishProgress()
     // If the streamed pull isn't possible (an older daemon, a registry that
@@ -744,7 +801,7 @@ Item {
       "POST",
       "/api/docker/" + item.endpointId + "/containers/" + item.containerId + "/recreate",
       JSON.stringify({ PullImage: pull === true }),
-      15 * 60)
+      15 * 60, Model.RESPONSE_LIMITS.recreate)
     recreateProc.running = true
   }
 
@@ -805,9 +862,8 @@ Item {
     id: syncProc
     running: false
     stdout: StdioCollector { id: syncOut; waitForEnd: true }
-    stderr: StdioCollector { id: syncErr; waitForEnd: true }
     onExited: function(exitCode) {
-      var result = Model.interpretResponse("catalog.sync", exitCode, syncOut.text, syncErr.text)
+      var result = Model.interpretResponse("catalog.sync", exitCode, syncOut.text, Model.RESPONSE_LIMITS.small)
       if (!result.ok) {
         if (!result.unreachable) root.lastError = "Catalog refresh failed: " + result.error
         root.runAppsQuery()
@@ -823,9 +879,8 @@ Item {
     id: appsProc
     running: false
     stdout: StdioCollector { id: appsOut; waitForEnd: true }
-    stderr: StdioCollector { id: appsErr; waitForEnd: true }
     onExited: function(exitCode) {
-      root.handleApps(Model.interpretResponse("/api/v2.0/app", exitCode, appsOut.text, appsErr.text))
+      root.handleApps(Model.interpretResponse("/api/v2.0/app", exitCode, appsOut.text, Model.RESPONSE_LIMITS.apps))
     }
   }
 
@@ -833,11 +888,10 @@ Item {
     id: startJobProc
     running: false
     stdout: StdioCollector { id: startJobOut; waitForEnd: true }
-    stderr: StdioCollector { id: startJobErr; waitForEnd: true }
     onExited: function(exitCode) {
       if (!root.installing) return
       root.handleJobStart(
-        Model.interpretResponse("app.upgrade", exitCode, startJobOut.text, startJobErr.text))
+        Model.interpretResponse("app.upgrade", exitCode, startJobOut.text, Model.RESPONSE_LIMITS.small))
     }
   }
 
@@ -845,10 +899,9 @@ Item {
     id: jobProc
     running: false
     stdout: StdioCollector { id: jobOut; waitForEnd: true }
-    stderr: StdioCollector { id: jobErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.handleJobPoll(
-        Model.interpretResponse("core.get_jobs", exitCode, jobOut.text, jobErr.text))
+        Model.interpretResponse("core.get_jobs", exitCode, jobOut.text, Model.RESPONSE_LIMITS.small))
     }
   }
 
@@ -856,10 +909,9 @@ Item {
     id: endpointsProc
     running: false
     stdout: StdioCollector { id: endpointsOut; waitForEnd: true }
-    stderr: StdioCollector { id: endpointsErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.handleEndpoints(Model.interpretResponse(
-        "/api/endpoints", exitCode, endpointsOut.text, endpointsErr.text, "Portainer"))
+        "/api/endpoints", exitCode, endpointsOut.text, Model.RESPONSE_LIMITS.endpoints, "Portainer"))
     }
   }
 
@@ -868,10 +920,9 @@ Item {
     property int endpointId: 0
     running: false
     stdout: StdioCollector { id: containersOut; waitForEnd: true }
-    stderr: StdioCollector { id: containersErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.handleContainerList(Model.interpretResponse(
-        "containers", exitCode, containersOut.text, containersErr.text, "Portainer"),
+        "containers", exitCode, containersOut.text, Model.RESPONSE_LIMITS.containers, "Portainer"),
         containersProc.endpointId)
     }
   }
@@ -881,10 +932,9 @@ Item {
     property string localKey: ""
     running: false
     stdout: StdioCollector { id: inspectOut; waitForEnd: true }
-    stderr: StdioCollector { id: inspectErr; waitForEnd: true }
     onExited: function(exitCode) {
       var result = Model.interpretResponse(
-        "image inspect", exitCode, inspectOut.text, inspectErr.text, "Portainer")
+        "image inspect", exitCode, inspectOut.text, Model.RESPONSE_LIMITS.imageInspect, "Portainer")
       if (!result.ok) {
         root.pushContainerError(result.error)
         // An image we cannot inspect is one we cannot judge: cache the empty
@@ -905,7 +955,6 @@ Item {
     running: false
     stdinEnabled: true
     stdout: StdioCollector { id: digestOut; waitForEnd: true }
-    stderr: StdioCollector { id: digestErr; waitForEnd: true }
     onStarted: {
       write(digestProc.token === ""
             ? "\n"
@@ -914,7 +963,7 @@ Item {
     }
     onExited: function(exitCode) {
       digestProc.stdinEnabled = true
-      root.handleDigest(Model.interpretDigestResponse(exitCode, digestOut.text, digestErr.text))
+      root.handleDigest(Model.interpretDigestResponse(exitCode, digestOut.text, Model.RESPONSE_LIMITS.registryHeaders))
     }
   }
 
@@ -922,10 +971,9 @@ Item {
     id: tokenProc
     running: false
     stdout: StdioCollector { id: tokenOut; waitForEnd: true }
-    stderr: StdioCollector { id: tokenErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.handleRegistryToken(Model.interpretResponse(
-        "registry auth", exitCode, tokenOut.text, tokenErr.text, "the registry"))
+        "registry auth", exitCode, tokenOut.text, Model.RESPONSE_LIMITS.registryToken, "the registry"))
     }
   }
 
@@ -936,17 +984,16 @@ Item {
     id: pullProc
     running: false
     stdout: SplitParser { onRead: function(line) { root.handlePullLine(line) } }
-    onExited: function(exitCode) { root.handlePullExit(exitCode) }
+    onExited: function() { root.handlePullExit() }
   }
 
   Process {
     id: recreateProc
     running: false
     stdout: StdioCollector { id: recreateOut; waitForEnd: true }
-    stderr: StdioCollector { id: recreateErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.handleRecreate(Model.interpretResponse(
-        "recreate", exitCode, recreateOut.text, recreateErr.text, "Portainer"))
+        "recreate", exitCode, recreateOut.text, Model.RESPONSE_LIMITS.recreate, "Portainer"))
     }
   }
 
@@ -1034,6 +1081,13 @@ Item {
       root.lastCheckManual = false
       root.check(false)
     }
+  }
+
+  Timer {
+    id: containerRetryTimer
+    interval: 120000
+    repeat: false
+    onTriggered: root.checkContainers()
   }
 
   Timer {
