@@ -189,6 +189,7 @@ omarchy-shell truenas refresh     # catalog.sync, then re-read the apps
 omarchy-shell truenas containers  # re-check unmanaged containers at their registries
 omarchy-shell truenas install     # apply everything pending
 omarchy-shell truenas settings    # open the popup on the connection form
+omarchy-shell truenas version     # which build is installed, e.g. "1.2.0"
 omarchy-shell truenas toggle      # show/hide the popup
 ```
 

@@ -81,6 +81,18 @@ function curlApiKeyConfig(apiKey) {
   return curlHeaderConfig("X-API-Key", apiKey)
 }
 
+// ------------------------------------------------------------------ version
+
+// The plugin's own version, for the settings footer and the `version` IPC
+// method. It is a constant rather than a read of manifest.json because QML
+// gets no handle on its own manifest — the shell's widget registry forwards
+// the `barWidget` block, `pluginId` and `sourceDir`, but not the version — and
+// reading the file at runtime would be I/O for a string that never changes.
+//
+// Kept honest by test/manifest-test.js, which fails if this and
+// manifest.json's `version` ever disagree.
+var VERSION = "1.2.0"
+
 // -------------------------------------------------------------- config file
 
 // TrueNAS SCALE answers on its own hostname out of the box, so that is where a

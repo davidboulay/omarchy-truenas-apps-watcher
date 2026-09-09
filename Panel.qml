@@ -231,6 +231,8 @@ Panel {
     function install(): string { nas.installAll(); return "ok" }
     // Opens the popup on the connection form, the same as the cog or `s`.
     function settings(): void { nasPanel.open(); nasPanel.openSettings() }
+    // Which build is actually running, without opening anything.
+    function version(): string { return Model.VERSION }
     function status(): string { return nas.summary }
     function count(): string { return String(nas.pendingTotal) }
     // Overall completion percent while applying, or "-1" when idle.
@@ -820,6 +822,24 @@ Panel {
             font.family: nasPanel.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+          }
+
+          PanelSeparator {
+            width: parent.width
+            foreground: nasPanel.foreground
+          }
+
+          // Which build is running. `omarchy plugin update` is a fast-forward
+          // of the plugin's own git checkout, so after an update this is the
+          // only thing in the UI that says whether it took.
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: "TrueNAS Apps Watcher v" + Model.VERSION
+            color: nasPanel.dim
+            font.family: nasPanel.fontFamily
+            font.pixelSize: Style.font.caption
+            horizontalAlignment: Text.AlignHCenter
           }
         }
       }

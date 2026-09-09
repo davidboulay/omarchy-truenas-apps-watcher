@@ -75,6 +75,17 @@ test("every settings key has a matching default", () => {
   }
 })
 
+// Model.VERSION is what the settings footer and the `version` IPC method
+// report. If it drifts from the manifest, the plugin lies about itself.
+test("Model.VERSION matches the manifest", () => {
+  const vm = require("vm")
+  const model = vm.createContext({})
+  vm.runInContext(fs.readFileSync(path.join(root, "Model.js"), "utf8"), model)
+  assert.strictEqual(model.VERSION, manifest.version,
+    "Model.js says " + model.VERSION + ", manifest.json says " + manifest.version)
+  assert.ok(/^\d+\.\d+\.\d+$/.test(manifest.version), manifest.version)
+})
+
 test("the folder holds no symlinks — the shell refuses them", () => {
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
