@@ -364,6 +364,173 @@ test("a tag has moved when the registry digest is none of the local ones", () =>
   assert.strictEqual(Model.imageIsStale(["sha256:aa"], ""), false)
 })
 
+// ------------------------------------------------- dependents (the outage)
+//
+// On 2026-09-09 the watcher recreated `gluetun`, which gave it a new container
+// id, and qBittorrent + FlareSolverr — both riding its network namespace —
+// lost their network for twenty minutes. FlareSolverr kept reporting healthy
+// with no network at all, so nothing alarmed. These fixtures are the shapes
+// verified on the live host.
+const STACK = [
+  { Id: "31099bfa11e8" + "0".repeat(52), Names: ["/gluetun"], Image: "qmcgaw/gluetun:latest",
+    ImageID: "sha256:g", State: "running",
+    Labels: { "com.docker.compose.project": "qbittorrent-vpn",
+              "com.docker.compose.service": "gluetun",
+              "com.docker.compose.project.working_dir": "/mnt/Homelab-Apps/Apps_Data/Dockge/Stacks/qbittorrent-vpn" },
+    HostConfig: { NetworkMode: "bridge" } },
+  // Pinned, so it never appears as updatable — and rides gluetun's namespace.
+  { Id: "aa" + "0".repeat(62), Names: ["/qbittorrent"], Image: "linuxserver/qbittorrent:5.2.3",
+    ImageID: "sha256:q", State: "running",
+    Labels: { "com.docker.compose.project": "qbittorrent-vpn",
+              "com.docker.compose.service": "qbittorrent",
+              "com.docker.compose.depends_on": "gluetun:service_healthy:false" },
+    HostConfig: { NetworkMode: "container:31099bfa11e8" + "0".repeat(52) } },
+  { Id: "bb" + "0".repeat(62), Names: ["/flaresolverr"], Image: "flaresolverr/flaresolverr:v3.5.0",
+    ImageID: "sha256:f", State: "running",
+    Labels: { "com.docker.compose.project": "qbittorrent-vpn",
+              "com.docker.compose.service": "flaresolverr" },
+    HostConfig: { NetworkMode: "container:31099bfa11e8" + "0".repeat(52) } },
+  // A :latest container with nothing attached — must still update normally.
+  { Id: "cc" + "0".repeat(62), Names: ["/watchstate"], Image: "ghcr.io/arabcoders/watchstate:latest",
+    ImageID: "sha256:w", State: "running", Labels: {}, HostConfig: { NetworkMode: "bridge" } }
+]
+
+const gluetun = STACK[0], watchstate = STACK[3]
+
+test("a container carrying network passengers is refused", () => {
+  const block = Model.dependencyBlock(gluetun, STACK)
+  assert.strictEqual(block.blocked, true)
+  assert.deepStrictEqual(plain(block.dependents), ["flaresolverr", "qbittorrent"])
+  assert.strictEqual(block.stackDir,
+    "/mnt/Homelab-Apps/Apps_Data/Dockge/Stacks/qbittorrent-vpn")
+  // The reason has to name them and say where to go instead.
+  assert.ok(block.reason.indexOf("qbittorrent") !== -1, block.reason)
+  assert.ok(block.reason.indexOf("new id") !== -1, block.reason)
+  assert.ok(block.reason.indexOf("/Dockge/Stacks/qbittorrent-vpn") !== -1, block.reason)
+})
+
+test("the passenger signal is the container id, not the name", () => {
+  assert.deepStrictEqual(plain(Model.networkPassengers(gluetun, STACK)),
+                         ["qbittorrent", "flaresolverr"])
+  // A different id must not match, however similar.
+  const other = { Id: "31099bfa11e9" + "0".repeat(52) }
+  assert.deepStrictEqual(plain(Model.networkPassengers(other, STACK)), [])
+})
+
+test("a declared compose dependency blocks even without a shared namespace", () => {
+  const plain_stack = [
+    { Id: "d1", Names: ["/db"], State: "running",
+      Labels: { "com.docker.compose.project": "app", "com.docker.compose.service": "db" },
+      HostConfig: { NetworkMode: "bridge" } },
+    { Id: "d2", Names: ["/web"], State: "running",
+      Labels: { "com.docker.compose.project": "app", "com.docker.compose.service": "web",
+                "com.docker.compose.depends_on": "db:service_started:true,cache:service_started:false" },
+      HostConfig: { NetworkMode: "bridge" } }
+  ]
+  const block = Model.dependencyBlock(plain_stack[0], plain_stack)
+  assert.strictEqual(block.blocked, true)
+  assert.deepStrictEqual(plain(block.dependents), ["web"])
+  // No working_dir label here, so the advice falls back to compose itself.
+  assert.ok(block.reason.indexOf("docker compose up -d") !== -1, block.reason)
+})
+
+test("depends_on is parsed out of its condition and restart fields", () => {
+  assert.deepStrictEqual(plain(Model.parseDependsOn("gluetun:service_healthy:false")), ["gluetun"])
+  assert.deepStrictEqual(plain(Model.parseDependsOn("a:x:false, b:y:true")), ["a", "b"])
+  assert.deepStrictEqual(plain(Model.parseDependsOn("")), [])
+})
+
+// Acceptance criterion 2: the guard must not block ordinary containers.
+test("an unmanaged container with no dependents still updates", () => {
+  const block = Model.dependencyBlock(watchstate, STACK)
+  assert.strictEqual(block.blocked, false)
+  assert.strictEqual(block.reason, "")
+  assert.deepStrictEqual(plain(block.dependents), [])
+})
+
+test("a dependency in another compose project is not a dependency", () => {
+  const elsewhere = [
+    { Id: "e1", Names: ["/one"], State: "running",
+      Labels: { "com.docker.compose.project": "alpha", "com.docker.compose.service": "svc" },
+      HostConfig: { NetworkMode: "bridge" } },
+    { Id: "e2", Names: ["/two"], State: "running",
+      Labels: { "com.docker.compose.project": "beta", "com.docker.compose.service": "other",
+                "com.docker.compose.depends_on": "svc:service_started:false" },
+      HostConfig: { NetworkMode: "bridge" } }
+  ]
+  assert.strictEqual(Model.dependencyBlock(elsewhere[0], elsewhere).blocked, false)
+})
+
+test("a blocked item is listed, counted apart, and never applied", () => {
+  const report = Model.emptyReport()
+  report.containers = [
+    Model.containerItem({ endpointId: 1, id: gluetun.Id, name: "gluetun",
+                          image: "qmcgaw/gluetun:latest", imageId: "sha256:g" },
+                        Model.dependencyBlock(gluetun, STACK)),
+    Model.containerItem({ endpointId: 1, id: watchstate.Id, name: "watchstate",
+                          image: "ghcr.io/arabcoders/watchstate:latest", imageId: "sha256:w" },
+                        Model.dependencyBlock(watchstate, STACK))
+  ]
+  report.totalContainers = 4
+  // Visible…
+  assert.deepStrictEqual(plain(Model.displayItems(report)).map(i => i.title),
+                         ["watchstate", "gluetun"])
+  // …but Apply only ever touches what it can apply.
+  assert.deepStrictEqual(plain(Model.pendingOrder(report)).map(i => i.title), ["watchstate"])
+  assert.strictEqual(Model.reportTotal(report), 1)
+  assert.strictEqual(Model.blockedTotal(report), 1)
+})
+
+// Nothing appliable, but something pending: the old code would have said
+// "up to date" and the user would only find out from Dockge.
+test("a blocked-only report does not claim to be up to date", () => {
+  const report = Model.emptyReport()
+  report.containers = [Model.containerItem(
+    { endpointId: 1, id: gluetun.Id, name: "gluetun", image: "qmcgaw/gluetun:latest", imageId: "s" },
+    Model.dependencyBlock(gluetun, STACK))]
+  report.totalApps = 27
+  report.totalContainers = 4
+  assert.strictEqual(
+    Model.summaryLine({ configured: true, everSucceeded: true, offline: false, report: report }),
+    "1 update needs a stack update")
+  // And no Apply row is offered.
+  assert.deepStrictEqual(plain(Model.navRows(report, {})).map(r => r.kind),
+                         ["check", "item", "open"])
+})
+
+// Only running containers are candidates. The list is fetched with ?all=1 so
+// stopped dependents are visible, which would otherwise make the watcher offer
+// to recreate — and thereby start — something deliberately stopped.
+test("stopped containers are seen for dependencies but never updated", () => {
+  const withStopped = STACK.concat([
+    { Id: "ff" + "0".repeat(62), Names: ["/paused-thing"], Image: "some/thing:latest",
+      ImageID: "sha256:p", State: "exited", Labels: {}, HostConfig: { NetworkMode: "bridge" } }
+  ])
+  const names = plain(Model.watchableContainers(withStopped, 1)).map(c => c.name)
+  assert.ok(names.indexOf("paused-thing") === -1, names.join(","))
+  assert.ok(names.indexOf("gluetun") !== -1, names.join(","))
+  assert.strictEqual(Model.isRunning({ State: "running" }), true)
+  assert.strictEqual(Model.isRunning({ State: "exited" }), false)
+  // Older spelling, for a proxy that only forwards Status.
+  assert.strictEqual(Model.isRunning({ Status: "Up 3 days" }), true)
+  assert.strictEqual(Model.isRunning({ Status: "Exited (0) 2 hours ago" }), false)
+  // Neither field: keep updating rather than silently doing nothing.
+  assert.strictEqual(Model.isRunning({}), true)
+})
+
+// A stopped passenger is the one most at risk: it cannot be restarted at all
+// once the container it rides has a new id.
+test("a stopped passenger still blocks its carrier", () => {
+  const downed = [
+    STACK[0],
+    { Id: "aa" + "0".repeat(62), Names: ["/qbittorrent"], State: "exited",
+      Labels: { "com.docker.compose.project": "qbittorrent-vpn",
+                "com.docker.compose.service": "qbittorrent" },
+      HostConfig: { NetworkMode: "container:" + STACK[0].Id } }
+  ]
+  assert.strictEqual(Model.dependencyBlock(downed[0], downed).blocked, true)
+})
+
 // ---------------------------------------------------------- registry lookups
 
 test("image references follow Docker's own defaulting rules", () => {

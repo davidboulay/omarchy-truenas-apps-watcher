@@ -39,11 +39,15 @@ Panel {
 
   readonly property var upgradeItems: nas.report.upgrades
   readonly property var imageItems: nas.report.images
-  readonly property var containerItems: nas.report.containers
+  readonly property var containerItems: Model.actionableContainers(nas.report)
+  // Pending, listed, and deliberately not applicable from here.
+  readonly property var blockedItems: Model.blockedContainers(nas.report)
   readonly property var navRows: Model.navRows(nas.report, { installing: nas.installing })
-  readonly property bool anyItems: nas.pendingTotal > 0
+  readonly property bool anyItems: nas.pendingTotal + blockedItems.length > 0
 
-  // Every pending item here is actionable, so the badge is simply the count.
+  // Only what this widget can actually apply. A container something else
+  // depends on is listed but never counted: the badge is a call to action, and
+  // there is no action to take on those from here.
   readonly property int badgeCount: nas.pendingTotal
   readonly property bool attention: badgeCount > 0
   readonly property bool hideWhenUpToDate: setting("hideWhenUpToDate", false) === true
@@ -60,6 +64,9 @@ Panel {
     var offset = 0
     if (section === "image") offset = upgradeItems.length
     else if (section === "container") offset = upgradeItems.length + imageItems.length
+    else if (section === "blocked") {
+      offset = upgradeItems.length + imageItems.length + containerItems.length
+    }
     return 1 + offset + index
   }
 
@@ -377,6 +384,23 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          // Pinned rather than left to its section, which scrolls: a blocked
+          // item is the one thing here that needs a decision instead of a
+          // click, so it must not be able to sit below the fold unseen.
+          Text {
+            textFormat: Text.PlainText
+            visible: nasPanel.blockedItems.length > 0
+            width: parent.width
+            text: nasPanel.blockedItems.length + " update"
+              + (nasPanel.blockedItems.length === 1 ? "" : "s")
+              + " below cannot be applied here — other containers depend on "
+              + (nasPanel.blockedItems.length === 1 ? "it" : "them") + "."
+            color: nasPanel.dim
+            font.family: nasPanel.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
           Text {
             textFormat: Text.PlainText
             visible: !nas.configured
@@ -454,6 +478,16 @@ Panel {
               items: nasPanel.containerItems
               section: "container"
               note: "Outside TrueNAS's apps — pulled and recreated in place."
+            }
+
+            // Recreating one container of a stack replaces it with a new
+            // container id, which breaks anything pinned to the old one. These
+            // are shown so the update is not hidden, and left alone.
+            UpdateSection {
+              title: "NEEDS A STACK UPDATE"
+              items: nasPanel.blockedItems
+              section: "blocked"
+              note: "Other containers depend on these, so recreating them here would break those. Update the stack instead."
             }
           }
         }
@@ -887,6 +921,20 @@ Panel {
         font.family: nasPanel.fontFamily
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight
+      }
+
+      // Which containers depend on it, and where to go instead. Wrapped
+      // rather than elided: the stack path is the actionable part.
+      Text {
+        textFormat: Text.PlainText
+        Layout.fillWidth: true
+        Layout.topMargin: Style.space(2)
+        visible: text !== ""
+        text: updateRow.item && updateRow.item.blocked ? String(updateRow.item.blockedReason) : ""
+        color: nasPanel.dim
+        font.family: nasPanel.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
       }
     }
   }

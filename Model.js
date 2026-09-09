@@ -434,6 +434,147 @@ function isTrueNasManaged(container) {
   return typeof project === "string" && project.indexOf("ix-") === 0
 }
 
+// --- compose metadata ------------------------------------------------------
+
+function composeLabel(container, name) {
+  var labels = (container && container.Labels) || {}
+  var value = labels[name]
+  return typeof value === "string" ? value : ""
+}
+
+function composeProject(container) {
+  return composeLabel(container, "com.docker.compose.project")
+}
+
+function composeService(container) {
+  return composeLabel(container, "com.docker.compose.service")
+}
+
+// Where the stack's compose file lives, so a blocked item can say where to go.
+function stackWorkingDir(container) {
+  return composeLabel(container, "com.docker.compose.project.working_dir")
+}
+
+// Only a running container is a candidate for an update. The container list is
+// fetched with `?all=1` so that stopped dependents are visible to the checks
+// below — without this filter that same flag would make the watcher offer to
+// recreate containers the user had deliberately stopped, and start them.
+//
+// `State` is what current Docker reports; `Status` ("Up 3 days", "Exited (0)
+// …") is the older spelling and covers a proxy that only forwards that. If
+// neither is present, treat it as running: that is what the list meant before
+// `?all=1` was added, and silently updating nothing at all is a worse failure
+// than the one this filter exists to prevent.
+function isRunning(container) {
+  if (!container) return false
+  var state = String(container.State || "")
+  if (state !== "") return state === "running"
+  var status = String(container.Status || "")
+  if (status !== "") return status.indexOf("Up") === 0
+  return true
+}
+
+// --- who depends on whom ---------------------------------------------------
+
+// `com.docker.compose.depends_on` is a comma-separated list of
+// `<service>:<condition>:<restart>` entries, e.g.
+// "gluetun:service_healthy:false".
+function parseDependsOn(value) {
+  var out = []
+  var parts = String(value || "").split(",")
+  for (var i = 0; i < parts.length; i++) {
+    var name = parts[i].split(":")[0].replace(/^\s+|\s+$/g, "")
+    if (name !== "") out.push(name)
+  }
+  return out
+}
+
+// Containers riding this one's network namespace — the fatal case.
+//
+// compose's `network_mode: "service:x"` is stored by Docker per container as a
+// literal `HostConfig.NetworkMode = "container:<x-id>"`. Recreating x gives it
+// a *new* id, so the passenger's namespace target stops existing: it cannot
+// start ("No such container"), and a passenger that was already running can
+// keep reporting healthy with no network at all, which is worse because
+// nothing alarms.
+function networkPassengers(container, all) {
+  var id = String((container && container.Id) || "")
+  var out = []
+  if (id === "") return out
+  for (var i = 0; i < (all || []).length; i++) {
+    var other = all[i]
+    if (!other || String(other.Id || "") === id) continue
+    var mode = other.HostConfig ? other.HostConfig.NetworkMode : ""
+    if (String(mode || "") === "container:" + id) out.push(containerDisplayName(other))
+  }
+  return out
+}
+
+// Containers in the same stack that declared a compose dependency on this
+// one's service.
+function composeDependants(container, all) {
+  var out = []
+  var project = composeProject(container)
+  var service = composeService(container)
+  if (project === "" || service === "") return out
+  var id = String((container && container.Id) || "")
+  for (var i = 0; i < (all || []).length; i++) {
+    var other = all[i]
+    if (!other || String(other.Id || "") === id) continue
+    if (composeProject(other) !== project) continue
+    var deps = parseDependsOn(composeLabel(other, "com.docker.compose.depends_on"))
+    for (var j = 0; j < deps.length; j++) {
+      if (deps[j] === service) {
+        out.push(containerDisplayName(other))
+        break
+      }
+    }
+  }
+  return out
+}
+
+// Whether this container may be recreated on its own, and if not, why.
+//
+// Portainer's recreate is per container: it renames the old one aside, creates
+// a replacement with a new id, and destroys the original. That is safe for a
+// standalone container and destructive for one that anything else is attached
+// to. Both signals come out of the container list already being fetched, so
+// this costs no extra request.
+function dependencyBlock(container, all) {
+  var names = networkPassengers(container, all)
+  var declared = composeDependants(container, all)
+  for (var i = 0; i < declared.length; i++) {
+    if (names.indexOf(declared[i]) === -1) names.push(declared[i])
+  }
+  names.sort()
+  if (names.length === 0) {
+    return { blocked: false, dependents: [], stackDir: "", reason: "" }
+  }
+  return {
+    blocked: true,
+    dependents: names,
+    stackDir: stackWorkingDir(container),
+    reason: dependencyReason(containerDisplayName(container), names, stackWorkingDir(container))
+  }
+}
+
+// Why the item is refused, and where to go instead. Refusing is the complete
+// fix, not a half one: Portainer's recreate reuses the container's existing
+// config, which still names the old namespace id, so recreating the dependents
+// afterwards reproduces the same breakage. Only `docker compose up -d`
+// re-resolves `service:x` to the new id, and this widget has no shell on the
+// NAS.
+function dependencyReason(name, dependents, stackDir) {
+  var n = dependents.length
+  var shown = dependents.slice(0, 3).join(", ")
+  if (n > 3) shown += ", +" + (n - 3) + " more"
+  var text = n + " container" + (n === 1 ? "" : "s") + " depend" + (n === 1 ? "s" : "") +
+    " on " + name + " (" + shown + "). Recreating it alone would give it a new id and break " +
+    (n === 1 ? "it" : "them") + "."
+  if (String(stackDir || "") !== "") return text + " Update the stack instead: " + stackDir
+  return text + " Update the whole stack instead (docker compose up -d)."
+}
+
 function containerDisplayName(container) {
   var names = (container && container.Names) || []
   for (var i = 0; i < names.length; i++) {
@@ -450,7 +591,9 @@ function isPinnedImage(image) {
   return ref === "" || ref.indexOf("@") !== -1 || ref.indexOf("sha256:") === 0
 }
 
-// The containers on one endpoint worth asking a registry about.
+// The containers on one endpoint worth asking a registry about. `raw` is the
+// container's own list entry, kept so the dependency checks can run against
+// the full list later without a second fetch.
 function watchableContainers(list, endpointId) {
   var result = []
   if (!list || typeof list.length !== "number") return result
@@ -459,12 +602,14 @@ function watchableContainers(list, endpointId) {
     if (!c || typeof c.Id !== "string") continue
     if (isTrueNasManaged(c)) continue
     if (isPinnedImage(c.Image)) continue
+    if (!isRunning(c)) continue
     result.push({
       endpointId: endpointId,
       id: c.Id,
       name: containerDisplayName(c),
       image: String(c.Image),
-      imageId: String(c.ImageID || "")
+      imageId: String(c.ImageID || ""),
+      raw: c
     })
   }
   return result
@@ -483,7 +628,8 @@ function repoDigests(inspect) {
   return out
 }
 
-function containerItem(candidate) {
+function containerItem(candidate, block) {
+  var verdict = block || { blocked: false, dependents: [], stackDir: "", reason: "" }
   return {
     key: "container:" + candidate.id,
     name: candidate.name,
@@ -493,7 +639,13 @@ function containerItem(candidate) {
     kind: "container",
     endpointId: candidate.endpointId,
     containerId: candidate.id,
-    image: candidate.image
+    image: candidate.image,
+    // A blocked item is still listed — hiding it would be claiming the update
+    // does not exist — but it never joins the apply queue.
+    blocked: verdict.blocked === true,
+    blockedReason: String(verdict.reason || ""),
+    dependents: verdict.dependents || [],
+    stackDir: String(verdict.stackDir || "")
   }
 }
 
@@ -706,25 +858,60 @@ function detailFraction(event) {
 
 // ---------------------------------------------------------------- the report
 
+// The containers that may actually be recreated on their own.
+function actionableContainers(report) {
+  var out = []
+  var list = (report && report.containers) || []
+  for (var i = 0; i < list.length; i++) if (!list[i].blocked) out.push(list[i])
+  return out
+}
+
+// The containers something else is attached to. Pending, listed, and refused.
+function blockedContainers(report) {
+  var out = []
+  var list = (report && report.containers) || []
+  for (var i = 0; i < list.length; i++) if (list[i].blocked) out.push(list[i])
+  return out
+}
+
+// What the badge counts and what Apply would act on: only what can be applied.
 function reportTotal(report) {
   if (!report) return 0
-  return report.upgrades.length + report.images.length + report.containers.length
+  return report.upgrades.length + report.images.length + actionableContainers(report).length
+}
+
+function blockedTotal(report) {
+  return blockedContainers(report).length
 }
 
 // Everything pending, in the order it is applied. TrueNAS's own apps go first
 // and one at a time — parallel upgrades would compete for the same Docker
-// daemon and the same pool datasets — and the unmanaged containers, which
-// nothing else depends on, come last.
+// daemon and the same pool datasets — and the unmanaged containers come last.
+//
+// Containers that anything else depends on are left out entirely. Portainer's
+// recreate is per container and gives the replacement a new id; a container
+// whose namespace or start order something else is pinned to cannot be
+// replaced that way without breaking it. This was not a theory: on
+// 2026-09-09 recreating `gluetun` took qBittorrent and FlareSolverr down for
+// twenty minutes, and FlareSolverr kept reporting healthy with no network,
+// so nothing alarmed. They are listed with a reason instead — see
+// dependencyBlock().
 function pendingOrder(report) {
   if (!report) return []
-  return report.upgrades.concat(report.images).concat(report.containers)
+  return report.upgrades.concat(report.images).concat(actionableContainers(report))
 }
 
-// Everything the panel draws, in the order it draws them. The same list:
-// unlike Home Assistant's update entities, every pending item here is
-// actionable, so there is no info-only pile to keep apart.
+// Everything the panel draws, in the order it draws them. Unlike the apply
+// order this includes the blocked containers: an update that exists must be
+// visible even when this widget is the wrong tool for it.
+// Draw order, which the panel's sections must match exactly — the keyboard
+// cursor walks this list by index.
 function displayItems(report) {
-  return pendingOrder(report)
+  if (!report) return []
+  return report.upgrades
+    .concat(report.images)
+    .concat(actionableContainers(report))
+    .concat(blockedContainers(report))
 }
 
 function versionsLine(item) {
@@ -754,6 +941,13 @@ function summaryLine(state) {
   if (state.installing) return "Installing updates…"
   if (state.checking) return "Checking for updates…"
   if (total > 0) return total + " update" + (total === 1 ? "" : "s") + " available"
+  // Nothing to apply, but something is pending: saying "up to date" here would
+  // be a lie the user could only discover by opening Dockge.
+  var blocked = blockedTotal(report)
+  if (blocked > 0) {
+    return blocked + " update" + (blocked === 1 ? "" : "s") + " need" + (blocked === 1 ? "s" : "") +
+      " a stack update"
+  }
   if (report.totalApps === 0 && report.totalContainers === 0) return "No apps found"
   if (report.totalContainers === 0) {
     return "All " + report.totalApps + " app" + (report.totalApps === 1 ? "" : "s") + " up to date"
@@ -771,7 +965,7 @@ function navRows(report, options) {
   var rows = [{ kind: "check" }]
   var items = displayItems(report)
   for (var i = 0; i < items.length; i++) rows.push({ kind: "item", item: items[i] })
-  if (items.length > 0 && !(options && options.installing)) rows.push({ kind: "apply" })
+  if (reportTotal(report) > 0 && !(options && options.installing)) rows.push({ kind: "apply" })
   rows.push({ kind: "open" })
   return rows
 }

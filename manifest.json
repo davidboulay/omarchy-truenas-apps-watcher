@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.davidboulay.truenas-apps-watcher",
   "name": "TrueNAS Apps Watcher",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "David Boulay",
   "license": "GPL-3.0-only",
   "description": "Watches a TrueNAS SCALE server for pending app upgrades and newer container images — and, through Portainer, for updates to the containers TrueNAS doesn't manage — and applies them from the bar.",

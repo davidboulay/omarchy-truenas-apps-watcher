@@ -370,6 +370,7 @@ Item {
   property int _endpointIndex: 0
   property var _candidates: []
   property int _candidateIndex: 0
+  property var _containersByEndpoint: ({})
   property var _localDigests: ({})
   property var _remoteDigests: ({})
   property var _foundContainers: []
@@ -383,6 +384,7 @@ Item {
     root._endpointIndex = 0
     root._candidates = []
     root._candidateIndex = 0
+    root._containersByEndpoint = {}
     root._localDigests = {}
     root._remoteDigests = {}
     root._foundContainers = []
@@ -437,14 +439,29 @@ Item {
     }
     var id = root._endpointIds[root._endpointIndex]
     containersProc.endpointId = id
+    // `?all=1` so stopped containers are visible. A dependent that is down is
+    // exactly the one at risk — it cannot be restarted once the container it
+    // rides has been given a new id — and Model.isRunning() keeps the stopped
+    // ones out of the update candidates.
     containersProc.command = portainerCommand(
-      "GET", "/api/endpoints/" + id + "/docker/containers/json", null, 30, Model.RESPONSE_LIMITS.containers)
+      "GET", "/api/endpoints/" + id + "/docker/containers/json?all=1", null, 30,
+      Model.RESPONSE_LIMITS.containers)
     containersProc.running = true
   }
 
   function handleContainerList(result, endpointId) {
-    if (!result.ok) pushContainerError(result.error)
-    else root._candidates = root._candidates.concat(Model.watchableContainers(result.data, endpointId))
+    if (!result.ok) {
+      pushContainerError(result.error)
+    } else {
+      root._candidates = root._candidates.concat(Model.watchableContainers(result.data, endpointId))
+      // Kept whole, per endpoint: the dependency checks need every container
+      // on the same daemon, including the pinned and stopped ones that are
+      // never candidates themselves. Both signals live in this one reply, so
+      // no extra request is made.
+      var byEndpoint = root._containersByEndpoint
+      byEndpoint[endpointId] = (result.data && typeof result.data.length === "number") ? result.data : []
+      root._containersByEndpoint = byEndpoint
+    }
     root._endpointIndex++
     nextEndpoint()
   }
@@ -484,7 +501,10 @@ Item {
     if (remote.error !== "") {
       pushContainerError(c.name + " (" + c.image + "): " + remote.error)
     } else if (Model.imageIsStale(local, remote.digest)) {
-      root._foundContainers = root._foundContainers.concat([Model.containerItem(c)])
+      // Decided here rather than at apply time so the popup can show the
+      // reason, and so Apply cannot pick it up by accident.
+      var block = Model.dependencyBlock(c.raw, root._containersByEndpoint[c.endpointId] || [])
+      root._foundContainers = root._foundContainers.concat([Model.containerItem(c, block)])
     }
     advanceCandidate()
   }
@@ -797,6 +817,13 @@ Item {
   }
 
   function recreateContainer(item, pull) {
+    // pendingOrder() already excludes blocked items, so reaching here would be
+    // a bug rather than a user action. Refuse anyway: this is the call that
+    // destroys the old container, and the cost of being wrong is an outage.
+    if (item.blocked === true) {
+      failCurrentItem(item.blockedReason !== "" ? item.blockedReason : "has dependent containers")
+      return
+    }
     recreateProc.command = portainerCommand(
       "POST",
       "/api/docker/" + item.endpointId + "/containers/" + item.containerId + "/recreate",

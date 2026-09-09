@@ -77,8 +77,10 @@ Everything lives in the popup's settings view:
 
 ## Features
 
-- **Bar badge with the pending count.** Everything it counts is actionable —
-  there is no pile of updates you can look at but not apply.
+- **Bar badge with the pending count.** It counts only what *Apply* can act
+  on, so it is always a call to action. Anything pending that this widget
+  should not touch is still listed — see the stack guard below — just never
+  counted.
 - **Three kinds of update, one list.**
   - **App upgrades** — a newer catalog version (`upgrade_available`), applied
     with `app.upgrade`.
@@ -90,6 +92,16 @@ Everything lives in the popup's settings view:
     doesn't manage: compose stacks, Dockge, hand-started containers. Watched by
     comparing the running image's digest against its registry, the same check
     Watchtower makes.
+- **It refuses to break a stack.** Portainer's recreate replaces one container
+  with a new container id. Anything pinned to the old one — a sidecar on
+  `network_mode: "service:x"`, a compose `depends_on` — breaks the moment that
+  id changes, and a namespace passenger can keep reporting *healthy* with no
+  network at all, so nothing alarms. Those containers are listed under **Needs
+  a stack update** with the dependents named and the stack's directory, and
+  *Apply* never touches them. Refusing is the whole fix, not half of it:
+  recreating the dependents afterwards reuses their existing config, which
+  still names the dead id, so only `docker compose up -d` repairs it — and this
+  widget has no shell on the NAS.
 - **Real progress, not a spinner.** TrueNAS runs upgrades as middleware *jobs*;
   the widget polls `core.get_jobs` and shows the job's own percentage. Container
   pulls stream per-layer progress from the Docker API, so the bar moves while

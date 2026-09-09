@@ -22,6 +22,11 @@ Environment switches:
                    seconds of each job, the way a reverse proxy does. The
                    plugin must keep polling rather than call the job failed.
   FAIL_APP=name    make that app's job end FAILED.
+
+The container fixtures include the `qbittorrent-vpn` stack from the 2026-09-09
+outage: `gluetun` on :latest carrying `qbittorrent` and `flaresolverr` in its
+network namespace. It must be listed as blocked and never recreated; the
+handler shouts "GUARD FAILED" if a recreate for it ever arrives.
 """
 import json
 import os
@@ -55,27 +60,70 @@ APPS = [
      "metadata": {"title": "Vaultwarden"}},
 ]
 
+GLUETUN_ID = "31099bfa11e8" + "0" * 52
+
 CONTAINERS = [
     {"Id": "c1" + "0" * 62, "Names": ["/dockge"], "Image": "louislam/dockge:1",
-     "ImageID": "sha256:aaa", "Labels": {"com.docker.compose.project": "dockge"}},
+     "ImageID": "sha256:aaa", "State": "running",
+     "Labels": {"com.docker.compose.project": "dockge"},
+     "HostConfig": {"NetworkMode": "bridge"}},
     {"Id": "c2" + "0" * 62, "Names": ["/caddy"], "Image": "caddy:2",
-     "ImageID": "sha256:bbb", "Labels": {}},
+     "ImageID": "sha256:bbb", "State": "running", "Labels": {},
+     "HostConfig": {"NetworkMode": "bridge"}},
     # TrueNAS's own — must be skipped, the apps check already covers it.
     {"Id": "c3" + "0" * 62, "Names": ["/ix-immich-server"],
      "Image": "ghcr.io/immich-app/immich-server:v1.99.0", "ImageID": "sha256:ccc",
-     "Labels": {"com.docker.compose.project": "ix-immich"}},
+     "State": "running", "Labels": {"com.docker.compose.project": "ix-immich"},
+     "HostConfig": {"NetworkMode": "bridge"}},
     # Pinned by digest — cannot drift, must be skipped.
     {"Id": "c4" + "0" * 62, "Names": ["/pinned"], "Image": "nginx@sha256:deadbeef",
-     "ImageID": "sha256:ddd", "Labels": {}},
+     "ImageID": "sha256:ddd", "State": "running", "Labels": {},
+     "HostConfig": {"NetworkMode": "bridge"}},
     # Built on the box: no RepoDigests, so there is nothing to compare.
     {"Id": "c5" + "0" * 62, "Names": ["/homebrew"], "Image": "my-own-thing:latest",
-     "ImageID": "sha256:eee", "Labels": {}},
+     "ImageID": "sha256:eee", "State": "running", "Labels": {},
+     "HostConfig": {"NetworkMode": "bridge"}},
+
+    # --- the 2026-09-09 outage, reproduced -------------------------------
+    # gluetun runs :latest, so it is the only one of the three that ever
+    # appears as updatable — and it is the one carrying the other two.
+    # Recreating it alone gives it a new container id and breaks them.
+    {"Id": GLUETUN_ID, "Names": ["/gluetun"], "Image": "qmcgaw/gluetun:latest",
+     "ImageID": "sha256:gluetun", "State": "running",
+     "Labels": {"com.docker.compose.project": "qbittorrent-vpn",
+                "com.docker.compose.service": "gluetun",
+                "com.docker.compose.project.working_dir":
+                    "/mnt/Homelab-Apps/Apps_Data/Dockge/Stacks/qbittorrent-vpn"},
+     "HostConfig": {"NetworkMode": "bridge"}},
+    # Pinned, so never updatable itself; rides gluetun's namespace and also
+    # declares the dependency, so both signals are exercised.
+    {"Id": "qb" + "0" * 62, "Names": ["/qbittorrent"],
+     "Image": "linuxserver/qbittorrent:5.2.3", "ImageID": "sha256:qb",
+     "State": "running",
+     "Labels": {"com.docker.compose.project": "qbittorrent-vpn",
+                "com.docker.compose.service": "qbittorrent",
+                "com.docker.compose.depends_on": "gluetun:service_healthy:false"},
+     "HostConfig": {"NetworkMode": "container:" + GLUETUN_ID}},
+    # Namespace passenger only, and stopped — the case that cannot be
+    # restarted at all once the carrier's id changes.
+    {"Id": "fs" + "0" * 62, "Names": ["/flaresolverr"],
+     "Image": "flaresolverr/flaresolverr:v3.5.0", "ImageID": "sha256:fs",
+     "State": "exited",
+     "Labels": {"com.docker.compose.project": "qbittorrent-vpn",
+                "com.docker.compose.service": "flaresolverr"},
+     "HostConfig": {"NetworkMode": "container:" + GLUETUN_ID}},
 ]
 
 IMAGES = {
     "sha256:aaa": {"RepoDigests": ["louislam/dockge@sha256:" + "1" * 64]},
     "sha256:bbb": {"RepoDigests": ["caddy@sha256:" + "2" * 64]},
     "sha256:eee": {"RepoDigests": []},
+    "sha256:gluetun": {"RepoDigests": ["qmcgaw/gluetun@sha256:" + "3" * 64]},
+    # The two passengers hold a fixed tag that does not move, which is why
+    # only gluetun ever showed up as updatable in the real outage. Empty
+    # RepoDigests is how the watcher spells "nothing at a registry to compare".
+    "sha256:qb": {"RepoDigests": []},
+    "sha256:fs": {"RepoDigests": []},
 }
 
 jobs = {}
@@ -208,7 +256,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json([{"Id": 1, "Type": 1, "Name": "local"},
                                        {"Id": 7, "Type": 3, "Name": "some-kubernetes"}])
             if re.match(r"^/api/endpoints/(\d+)/docker/containers/json$", path):
-                return self.send_json(CONTAINERS)
+                # Docker lists only running containers unless asked for all,
+                # so the mock does too — the watcher relies on ?all=1 to see
+                # stopped dependents.
+                if (query.get("all") or ["0"])[0] in ("1", "true"):
+                    return self.send_json(CONTAINERS)
+                return self.send_json([c for c in CONTAINERS if c.get("State") == "running"])
             m = re.match(r"^/api/endpoints/(\d+)/docker/images/([^/]+)/json$", path)
             if m:
                 image = IMAGES.get(m.group(2))
@@ -242,7 +295,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_body()
                 # Which path the client took: a streamed pull first (False), or
                 # letting the recreate pull for it (True, the fallback).
-                print("recreate PullImage=%r" % body.get("PullImage"), flush=True)
+                print("recreate PullImage=%r container=%s"
+                      % (body.get("PullImage"), m.group(2)[:12]), flush=True)
+                if m.group(2) == GLUETUN_ID:
+                    # The whole point of the guard. If this ever prints, the
+                    # watcher just reproduced the outage.
+                    print("!!! GUARD FAILED: recreated gluetun, which carries "
+                          "qbittorrent and flaresolverr", flush=True)
                 time.sleep(1.0)
                 return self.send_json({"Id": m.group(2), "State": {"Running": True}})
         return self.send_json({"message": "not found"}, 404)
